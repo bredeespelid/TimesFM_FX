@@ -33,9 +33,5 @@ How to run (quick)
    python src/Times2.5.py
 
 Notes and assumptions
-- Comments and original logic in the scripts were preserved. I did not alter algorithmic comments or change computation steps.
 - The repository does not include large model weights or the TimesFM repo. The scripts expect TimesFM to be installed separately.
 
-Next steps you might want
-- Add unit tests or a small smoke test that runs data loading and a fast deterministic forecast function.
-- Add a simple runner (Makefile or CLI) to orchestrate experiments.
