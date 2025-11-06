@@ -14,11 +14,5 @@ dist/
 # macOS system files
 .DS_Store
 
-# Data folder — keep structure, ignore large or raw data files
-data/*
-!data/.gitkeep
-!data/README.md
-!data/sample.csv
-
 # Ignore PDFs only
 *.pdf
