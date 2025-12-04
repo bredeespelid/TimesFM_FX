@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 TimesFM 2.5 (200M, PyTorch) – EUR/NOK walk-forward (monthly, levels), point forecast only
-- Data: GitHub CSV (semicolon-separated; decimal comma), forward-filled to daily
+- Data: GitHub all-variables daily panel (comma-separated), forward-filled to daily
 - Cut: last business day of previous month
 - Forecast: next calendar month at daily frequency -> aggregate to monthly mean over business days
 - Metrics: Observations, RMSE, MAE, Directional accuracy
@@ -20,18 +20,23 @@ import requests, certifi
 from sklearn.metrics import mean_absolute_error
 import matplotlib.pyplot as plt
 
-import timesfm  # TimesFM 2.5 repo install required (pip install -e . from github.com/google-research/timesfm)
+import timesfm
+import torch
 
 # -----------------------------
 # Configuration
 # -----------------------------
 @dataclass
 class Config:
-    url: str = "https://raw.githubusercontent.com/bredeespelid/Data_MasterOppgave/refs/heads/main/EURNOK/EUR_NOK_NorgesBank.csv"
-    m_freq: str = "M"         # monthly evaluation
+    # all-variables daily panel (same source as TimesFM 2.0)
+    url: str = (
+        "https://raw.githubusercontent.com/bredeespelid/"
+        "Data_MasterOppgave/refs/heads/main/Variables/All_Variables/variables_daily.csv"
+    )
+    m_freq: str = "M"
     min_hist_days: int = 40
     max_context: int = 2048
-    max_horizon: int = 64     # must exceed longest month (≈31); 64 leaves margin
+    max_horizon: int = 64
     retries: int = 3
     timeout: int = 60
     verbose: bool = True
@@ -60,39 +65,40 @@ def download_csv_text(url: str, retries: int, timeout: int) -> str:
     raise RuntimeError(f"Download failed: {last_err}")
 
 # -----------------------------
-# Data loading
+# Data loading (all variables)
 # -----------------------------
 def load_series(url: str) -> Tuple[pd.Series, pd.Series]:
     """
-    Load Norges Bank CSV (semicolon-separated; decimal comma) with columns TIME_PERIOD, OBS_VALUE.
+    Load all-variables daily CSV (comma-separated).
+    Expected columns: Date, EUR_NOK, ...
     Returns:
       S_b: business-day (B) with ffill (used for cuts and monthly ground truth)
       S_d: daily (D) with ffill (model inputs and daily forecasts)
     """
     text = download_csv_text(url, CFG.retries, CFG.timeout)
-    raw = pd.read_csv(io.StringIO(text), sep=';', encoding='utf-8-sig', decimal=',')
+    raw = pd.read_csv(io.StringIO(text))
 
-    required_cols = {"TIME_PERIOD", "OBS_VALUE"}
+    required_cols = {"Date", "EUR_NOK"}
     missing = required_cols - set(raw.columns)
     if missing:
         raise ValueError(f"Missing columns in CSV: {missing}. Got: {list(raw.columns)}")
 
-    df = (raw[['TIME_PERIOD', 'OBS_VALUE']]
-          .rename(columns={'OBS_VALUE': 'EUR_NOK'})
-          .assign(TIME_PERIOD=lambda x: pd.to_datetime(x['TIME_PERIOD'], errors='coerce'))
-          .dropna(subset=['TIME_PERIOD', 'EUR_NOK'])
-          .sort_values('TIME_PERIOD')
-          .set_index('TIME_PERIOD'))
+    df = (
+        raw[list(required_cols)]
+        .rename(columns={"Date": "DATE"})
+        .assign(DATE=lambda x: pd.to_datetime(x["DATE"], errors="coerce"))
+        .dropna(subset=["DATE", "EUR_NOK"])
+        .sort_values("DATE")
+        .set_index("DATE")
+    )
 
-    # Business-day series (truth/aggregation base)
-    S_b = df['EUR_NOK'].asfreq('B').ffill().astype(float)
-    S_b.name = 'EUR_NOK'
+    S_b = df["EUR_NOK"].asfreq("B").ffill().astype(float)
+    S_b.name = "EUR_NOK"
 
-    # Daily series (model inputs / daily forecasts)
-    full_idx = pd.date_range(df.index.min(), df.index.max(), freq='D')
-    S_d = df['EUR_NOK'].reindex(full_idx).ffill().astype(float)
-    S_d.index.name = 'DATE'
-    S_d.name = 'EUR_NOK'
+    full_idx = pd.date_range(df.index.min(), df.index.max(), freq="D")
+    S_d = df["EUR_NOK"].reindex(full_idx).ffill().astype(float)
+    S_d.index.name = "DATE"
+    S_d.name = "EUR_NOK"
     return S_b, S_d
 
 def last_trading_day(S_b: pd.Series, start: pd.Timestamp, end: pd.Timestamp) -> Optional[pd.Timestamp]:
@@ -109,13 +115,22 @@ def build_model_25(max_context: int, horizon_len: int) -> Callable[[np.ndarray, 
         forecast_fn(x_1d, H) -> np.ndarray of length H (point forecast).
     """
     if not hasattr(timesfm, "TimesFM_2p5_200M_torch"):
-        raise RuntimeError("TimesFM 2.5 API not found. Ensure the 2.5 package is installed (pip install -e .).")
+        raise RuntimeError(
+            "TimesFM 2.5 API not found. Install from repo with torch extras:\n"
+            "  git clone https://github.com/google-research/timesfm.git\n"
+            "  cd timesfm\n"
+            "  pip install -e .[torch]"
+        )
 
     repo_id = "google/timesfm-2.5-200m-pytorch"
     model = None
     cls = timesfm.TimesFM_2p5_200M_torch
 
-    # Try to load pretrained weights from Hugging Face; fall back to local checkpoint or random init
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
     if hasattr(cls, "from_pretrained"):
         try:
             if CFG.verbose:
@@ -134,13 +149,12 @@ def build_model_25(max_context: int, horizon_len: int) -> Callable[[np.ndarray, 
                 if CFG.verbose:
                     print("Warning: load_checkpoint failed/unavailable; using randomly initialized weights (not recommended).")
 
-    # Optional forecast config
     if hasattr(timesfm, "ForecastConfig"):
         cfg = timesfm.ForecastConfig(
             max_context=max_context,
             max_horizon=horizon_len,
             normalize_inputs=True,
-            use_continuous_quantile_head=False,  # we only need point forecasts
+            use_continuous_quantile_head=False,
             force_flip_invariance=True,
             infer_is_positive=False,
             fix_quantile_crossing=True,
@@ -149,11 +163,9 @@ def build_model_25(max_context: int, horizon_len: int) -> Callable[[np.ndarray, 
             model.compile(cfg)
 
     def _forecast(x: np.ndarray, H: int) -> np.ndarray:
-        """Return H-step point forecast for a 1D input history x."""
         if not hasattr(model, "forecast"):
             raise RuntimeError("TimesFM 2.5 model missing 'forecast' method.")
         out = model.forecast(horizon=H, inputs=[x])
-        # API may return (point, quantiles) or point only
         if isinstance(out, tuple):
             point = out[0][0]
         else:
@@ -166,12 +178,6 @@ def build_model_25(max_context: int, horizon_len: int) -> Callable[[np.ndarray, 
 # Monthly walk-forward using TimesFM 2.5
 # -----------------------------
 def walk_forward_timesfm25_monthly(S_b: pd.Series, S_d: pd.Series, forecast_fn: Callable[[np.ndarray, int], np.ndarray]) -> pd.DataFrame:
-    """
-    For each calendar month m:
-      - cut at last business day of previous month
-      - forecast full calendar month at daily frequency
-      - aggregate to business-day monthly mean and compare to truth
-    """
     first_m = pd.Period(S_b.index.min(), freq=CFG.m_freq)
     last_m  = pd.Period(S_b.index.max(),  freq=CFG.m_freq)
     months = pd.period_range(first_m, last_m, freq=CFG.m_freq)
@@ -194,20 +200,17 @@ def walk_forward_timesfm25_monthly(S_b: pd.Series, S_d: pd.Series, forecast_fn: 
             dropped[str(m)] = f"hist<{CFG.min_hist_days}"
             continue
 
-        # Business days inside target month
         idx_m_b = S_b.index[(S_b.index >= m_start) & (S_b.index <= m_end)]
         if idx_m_b.size < 1:
             dropped[str(m)] = "no_bdays_in_month"
             continue
         y_true = float(S_b.loc[idx_m_b].mean())
 
-        # Horizon = full calendar month length (inclusive)
         H = (m_end.date() - m_start.date()).days + 1
         if H <= 0 or H > CFG.max_horizon:
             dropped[str(m)] = f"horizon_invalid(H={H})"
             continue
 
-        # Context clipping and model forecast
         context = min(CFG.max_context, len(hist_d))
         x = hist_d.values[-context:]
         pf = forecast_fn(x, H)
@@ -215,11 +218,9 @@ def walk_forward_timesfm25_monthly(S_b: pd.Series, S_d: pd.Series, forecast_fn: 
             dropped[str(m)] = f"horizon_short({pf.shape[0]})"
             continue
 
-        # Index daily forecast from cut+1 over H calendar days
         f_idx = pd.date_range(cut + pd.Timedelta(days=1), periods=H, freq='D')
         pred_daily = pd.Series(pf[:H], index=f_idx, name='point')
 
-        # Aggregate forecast to business-day mean over the month
         pred_b = pred_daily.reindex(idx_m_b, method=None)
         if pred_b.isna().all():
             dropped[str(m)] = "no_overlap_pred_B_days"
@@ -244,7 +245,6 @@ def walk_forward_timesfm25_monthly(S_b: pd.Series, S_d: pd.Series, forecast_fn: 
 # Evaluation (level + direction)
 # -----------------------------
 def evaluate(eval_df: pd.DataFrame) -> pd.DataFrame:
-    """Compute level errors and directional accuracy."""
     df = eval_df.copy()
     df["err"] = df["y_true"] - df["y_pred"]
     core = df.dropna(subset=["y_true", "y_pred"]).copy()
@@ -274,14 +274,9 @@ def evaluate(eval_df: pd.DataFrame) -> pd.DataFrame:
 # Diebold–Mariano (vs Random Walk)
 # -----------------------------
 def _normal_cdf(z: float) -> float:
-    """Standard normal CDF without scipy."""
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 def dm_test(y_true: pd.Series, y_model: pd.Series, y_rw: pd.Series, h: int = 1, loss: str = "mse") -> Tuple[float, float]:
-    """
-    Diebold–Mariano test for equal predictive accuracy.
-    Returns (DM statistic, p-value). Uses simple NW/Bartlett HAC up to lag h-1.
-    """
     df = pd.concat({"y": y_true, "m": y_model, "rw": y_rw}, axis=1).dropna()
     if df.empty or len(df) < 5:
         return float("nan"), float("nan")
@@ -309,7 +304,6 @@ def dm_test(y_true: pd.Series, y_model: pd.Series, y_rw: pd.Series, h: int = 1, 
     return dm_stat, p_val
 
 def dm_against_random_walk(eval_df: pd.DataFrame, loss: str = "mse", h: int = 1) -> None:
-    """Random walk benchmark = previous month's observed level (y_{t-1})."""
     df = eval_df.copy()
     df["rw_pred"] = df["y_true"].shift(1)
     dm_stat, p_val = dm_test(df["y_true"], df["y_pred"], df["rw_pred"], h=h, loss=loss)
@@ -322,7 +316,6 @@ def dm_against_random_walk(eval_df: pd.DataFrame, loss: str = "mse", h: int = 1)
 # Plot (no bands)
 # -----------------------------
 def plot_monthly_simple(eval_df: pd.DataFrame, png_path: str, pdf_path: str):
-    """Simple line plot: actual vs forecast (monthly mean)."""
     if eval_df.empty:
         print("Nothing to plot.")
         return
@@ -330,9 +323,7 @@ def plot_monthly_simple(eval_df: pd.DataFrame, png_path: str, pdf_path: str):
     plt.figure(figsize=(10, 6))
     x = eval_df.index.to_timestamp() if isinstance(eval_df.index, pd.PeriodIndex) else eval_df.index
 
-    # Actual: black
     plt.plot(x, eval_df["y_true"], color="black", label="Actual (monthly mean, B-days)")
-    # Forecast: blue dashed
     plt.plot(x, eval_df["y_pred"], color="tab:blue", linestyle="--", label="Forecast (TimesFM 2.5)")
 
     plt.title("TimesFM 2.5 Forecast vs Actual (Monthly Mean, EUR/NOK)")
@@ -352,23 +343,18 @@ def plot_monthly_simple(eval_df: pd.DataFrame, png_path: str, pdf_path: str):
 # Main
 # -----------------------------
 def main():
-    # 1) Data
     S_b, S_d = load_series(CFG.url)
     if CFG.verbose:
         print(f"Data (B): {S_b.index.min().date()} → {S_b.index.max().date()} | n={len(S_b)}")
         print(f"Data (D): {S_d.index.min().date()} → {S_d.index.max().date()} | n={len(S_d)}")
 
-    # 2) Model (TimesFM 2.5) and forecast wrapper
     forecast_fn = build_model_25(max_context=CFG.max_context, horizon_len=min(CFG.max_horizon, 64))
 
-    # 3) Monthly walk-forward and evaluation
     df_eval = walk_forward_timesfm25_monthly(S_b, S_d, forecast_fn)
     eval_df = evaluate(df_eval)
 
-    # 4) Diebold–Mariano vs Random Walk (MSE; h=1)
     dm_against_random_walk(eval_df, loss="mse", h=1)
 
-    # 5) Plot
     plot_monthly_simple(eval_df, CFG.fig_png, CFG.fig_pdf)
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 TimesFM 2.5 – EUR/NOK walk-forward (quarterly, levels) with unified metrics/plot
-- Data: GitHub CSV (semicolon; decimal comma), forward-filled to daily
+- Data: GitHub all-variables daily panel (comma-separated), forward-filled to daily
 - Cut = last B-day in previous quarter
 - Forecast next quarter at daily frequency -> aggregate to quarterly mean over B-days
 - Print: Observations, RMSE, MAE, Directional accuracy
@@ -9,11 +9,10 @@ TimesFM 2.5 – EUR/NOK walk-forward (quarterly, levels) with unified metrics/pl
 - Plot: Actual (black) vs Forecast (blue dashed), no quantile bands
 
 Prereqs:
-  pip install pandas numpy scikit-learn requests certifi matplotlib
-  # PyTorch (CPU): pip install torch --index-url https://download.pytorch.org/whl/cpu
-  # TimesFM 2.5 from repo:
-  #   git clone https://github.com/google-research/timesfm.git
-  #   cd timesfm && pip install -e . && cd ..
+    pip install pandas numpy scikit-learn requests certifi matplotlib
+    pip install torch --index-url https://download.pytorch.org/whl/cpu
+    git clone https://github.com/google-research/timesfm.git
+    cd timesfm && pip install -e .[torch] && cd ..
 """
 
 from __future__ import annotations
@@ -28,13 +27,17 @@ from sklearn.metrics import mean_absolute_error
 import matplotlib.pyplot as plt
 
 import timesfm  # MUST be the 2.5 repo install; no fallback
+import torch
 
 # -----------------------------
 # Config
 # -----------------------------
 @dataclass
 class Config:
-    url: str = "https://raw.githubusercontent.com/bredeespelid/Data_MasterOppgave/refs/heads/main/EURNOK/EUR_NOK_NorgesBank.csv"
+    url: str = (
+        "https://raw.githubusercontent.com/bredeespelid/"
+        "Data_MasterOppgave/refs/heads/main/Variables/All_Variables/variables_daily.csv"
+    )
     q_freq: str = "Q-DEC"
     min_hist_days: int = 40
     max_context: int = 2048
@@ -67,32 +70,37 @@ def download_csv_text(url: str, retries: int, timeout: int) -> str:
 
 def load_series(url: str) -> Tuple[pd.Series, pd.Series]:
     """
-    Reads GitHub CSV (semicolon + decimal comma).
+    Reads GitHub all-variables daily CSV (comma-separated).
+    Expected columns at minimum: Date, EUR_NOK, ...
+
     Returns:
       S_b: business-day (B) with ffill (for cut and quarterly ground truth)
       S_d: daily (D) with ffill (for model inputs and daily forecasts)
     """
     text = download_csv_text(url, CFG.retries, CFG.timeout)
-    raw = pd.read_csv(io.StringIO(text), sep=';', encoding='utf-8-sig', decimal=',')
-    required_cols = {"TIME_PERIOD", "OBS_VALUE"}
+    raw = pd.read_csv(io.StringIO(text))
+
+    required_cols = {"Date", "EUR_NOK"}
     missing = required_cols - set(raw.columns)
     if missing:
         raise ValueError(f"Missing columns in CSV: {missing}. Got: {list(raw.columns)}")
 
-    df = (raw[['TIME_PERIOD', 'OBS_VALUE']]
-          .rename(columns={'OBS_VALUE': 'EUR_NOK'})
-          .assign(TIME_PERIOD=lambda x: pd.to_datetime(x['TIME_PERIOD'], errors='coerce'))
-          .dropna(subset=['TIME_PERIOD', 'EUR_NOK'])
-          .sort_values('TIME_PERIOD')
-          .set_index('TIME_PERIOD'))
+    df = (
+        raw[list(required_cols)]
+        .rename(columns={"Date": "DATE"})
+        .assign(DATE=lambda x: pd.to_datetime(x["DATE"], errors="coerce"))
+        .dropna(subset=["DATE", "EUR_NOK"])
+        .sort_values("DATE")
+        .set_index("DATE")
+    )
 
-    S_b = df['EUR_NOK'].asfreq('B').ffill().astype(float)
-    S_b.name = 'EUR_NOK'
+    S_b = df["EUR_NOK"].asfreq("B").ffill().astype(float)
+    S_b.name = "EUR_NOK"
 
-    full_idx = pd.date_range(df.index.min(), df.index.max(), freq='D')
-    S_d = df['EUR_NOK'].reindex(full_idx).ffill().astype(float)
-    S_d.index.name = 'DATE'
-    S_d.name = 'EUR_NOK'
+    full_idx = pd.date_range(df.index.min(), df.index.max(), freq="D")
+    S_d = df["EUR_NOK"].reindex(full_idx).ffill().astype(float)
+    S_d.index.name = "DATE"
+    S_d.name = "EUR_NOK"
     return S_b, S_d
 
 def last_trading_day(S_b: pd.Series, start: pd.Timestamp, end: pd.Timestamp) -> Optional[pd.Timestamp]:
@@ -110,28 +118,34 @@ def build_model(max_context: int, horizon_len: int) -> Callable[[np.ndarray, int
     STRICT: Only TimesFM 2.5 repo API is allowed; no fallback.
     """
     if not hasattr(timesfm, "TimesFM_2p5_200M_torch"):
-        raise RuntimeError("TimesFM 2.5 repo API not found. Ensure the 2.5 package is installed (pip install -e .).")
+        raise RuntimeError(
+            "TimesFM 2.5 API not found. Install from repo with torch extras:\n"
+            "  git clone https://github.com/google-research/timesfm.git\n"
+            "  cd timesfm\n"
+            "  pip install -e .[torch]"
+        )
 
-    # Prefer loading the Hugging Face checkpoint using the repo API when available
     repo_id = "google/timesfm-2.5-200m-pytorch"
     m = None
     cls = timesfm.TimesFM_2p5_200M_torch
+
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
     if hasattr(cls, "from_pretrained"):
         try:
             if CFG.verbose:
                 print(f"Loading TimesFM checkpoint from Hugging Face: {repo_id}")
-            # Use from_pretrained; avoid torch.compile by default to keep compatibility
             m = cls.from_pretrained(repo_id, torch_compile=False)
         except Exception as e:
             if CFG.verbose:
                 print(f"Could not load checkpoint from Hugging Face: {e}. Falling back to local init.")
 
-    # Fallback: instantiate local class and attempt to load a local checkpoint if supported
     if m is None:
         m = cls()
         if hasattr(m, "load_checkpoint"):
-            # Some repo builds require a 'path' argument; try the no-arg call first,
-            # fall back to path=None, and otherwise skip loading the checkpoint.
             try:
                 m.load_checkpoint()
             except TypeError:
@@ -146,7 +160,7 @@ def build_model(max_context: int, horizon_len: int) -> Callable[[np.ndarray, int
             max_context=max_context,
             max_horizon=horizon_len,
             normalize_inputs=True,
-            use_continuous_quantile_head=False,  # point forecasts only for identical plot
+            use_continuous_quantile_head=False,
             force_flip_invariance=True,
             infer_is_positive=True,
             fix_quantile_crossing=True,
@@ -158,7 +172,6 @@ def build_model(max_context: int, horizon_len: int) -> Callable[[np.ndarray, int
         if not hasattr(m, "forecast"):
             raise RuntimeError("TimesFM 2.5 API missing 'forecast'.")
         out = m.forecast(horizon=H, inputs=[x])
-        # Some builds return (point, quant) tuple; handle both
         if isinstance(out, tuple):
             point = out[0][0]
         else:
@@ -314,9 +327,7 @@ def plot_quarterly_simple(eval_df: pd.DataFrame, png_path: str, pdf_path: str):
     x = eval_df.index.to_timestamp() if isinstance(eval_df.index, pd.PeriodIndex) else eval_df.index
 
     plt.figure(figsize=(10, 6))
-    # Actual: black
     plt.plot(x, eval_df["y_true"], color="black", label="Actual (quarterly mean)")
-    # Forecast: blue dashed
     plt.plot(x, eval_df["y_pred"], color="tab:blue", linestyle="--", label="Forecast (TimesFM)")
 
     plt.title("TimesFM Forecast vs Actual (Quarterly Mean, EUR/NOK)")
@@ -336,16 +347,13 @@ def plot_quarterly_simple(eval_df: pd.DataFrame, png_path: str, pdf_path: str):
 # Main
 # -----------------------------
 def main():
-    # Data
     S_b, S_d = load_series(CFG.url)
     if CFG.verbose:
         print(f"Data (B): {S_b.index.min().date()} → {S_b.index.max().date()} | n={len(S_b)}")
         print(f"Data (D): {S_d.index.min().date()} → {S_d.index.max().date()} | n={len(S_d)}")
 
-    # Model (TimesFM 2.5 only)
     forecast_fn = build_model(max_context=CFG.max_context, horizon_len=min(CFG.max_horizon, 256))
 
-    # Walk-forward, evaluate, DM-test, plot
     df_eval = walk_forward_timesfm(S_b, S_d, forecast_fn)
     eval_df = evaluate(df_eval)
     dm_against_random_walk(eval_df, loss="mse", h=1)

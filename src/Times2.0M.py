@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-TimesFM 2.0 (500M, PyTorch) – EUR/NOK walk-forward (månedlig) uten konfidensintervall
-Kilde: GitHub (semicolon-separert, desimal-komma)
+TimesFM 2.0 (500M, PyTorch) – EUR/NOK walk-forward (monthly) without prediction intervals.
+Source: GitHub all-variables daily panel (comma-separated).
 """
 
 from __future__ import annotations
@@ -23,11 +23,14 @@ import timesfm  # v1-API (timesfm==1.3.0)
 # -----------------------------
 @dataclass
 class Config:
-    url: str = "https://raw.githubusercontent.com/bredeespelid/Data_MasterOppgave/refs/heads/main/EURNOK/EUR_NOK_NorgesBank.csv"
-    m_freq: str = "M"      # månedlig evaluering
+    url: str = (
+        "https://raw.githubusercontent.com/bredeespelid/"
+        "Data_MasterOppgave/refs/heads/main/Variables/All_Variables/variables_daily.csv"
+    )
+    m_freq: str = "M"      # monthly evaluation
     min_hist_days: int = 40
     max_context: int = 2048
-    max_horizon: int = 64  # > maks månedslengde
+    max_horizon: int = 64  # must exceed the longest month
     retries: int = 3
     timeout: int = 60
     verbose: bool = True
@@ -37,7 +40,7 @@ class Config:
 CFG = Config()
 
 # -----------------------------
-# Hjelp: nedlasting
+# Helper: download
 # -----------------------------
 def download_csv_text(url: str, retries: int, timeout: int) -> str:
     last_err = None
@@ -59,48 +62,57 @@ def download_csv_text(url: str, retries: int, timeout: int) -> str:
 # -----------------------------
 def load_series(url: str) -> Tuple[pd.Series, pd.Series]:
     """
-    Leser GitHub-CSV (semikolon + desimal-komma).
-    Returnerer:
-      S_b: business-day (B) med ffill (for cut og månedsfasit)
-      S_d: daglig (D) med ffill (for modellinput og dagprognoser)
+    Read the all-variables daily CSV from GitHub.
+
+    Expected columns (at minimum):
+      Date, EUR_NOK, ...
+
+    Returns:
+      S_b: business-day (B) EUR/NOK with forward fill (used for cuts and monthly truth)
+      S_d: daily (D) EUR/NOK with forward fill (model inputs and daily forecasts)
     """
     text = download_csv_text(url, CFG.retries, CFG.timeout)
-    raw = pd.read_csv(io.StringIO(text), sep=';', encoding='utf-8-sig', decimal=',')
+    raw = pd.read_csv(io.StringIO(text))
 
-    # Sjekk forventede kolonner
-    required_cols = {"TIME_PERIOD", "OBS_VALUE"}
+    required_cols = {"Date", "EUR_NOK"}
     missing = required_cols - set(raw.columns)
     if missing:
-        raise ValueError(f"Mangler kolonner i CSV: {missing}. Fikk: {list(raw.columns)}")
+        raise ValueError(f"Missing columns in CSV: {missing}. Got: {list(raw.columns)}")
 
-    df = (raw[['TIME_PERIOD', 'OBS_VALUE']]
-          .rename(columns={'OBS_VALUE': 'EUR_NOK'})
-          .assign(TIME_PERIOD=lambda x: pd.to_datetime(x['TIME_PERIOD'], errors='coerce'))
-          .dropna(subset=['TIME_PERIOD', 'EUR_NOK'])
-          .sort_values('TIME_PERIOD')
-          .set_index('TIME_PERIOD'))
+    df = (
+        raw[list(required_cols)]
+        .rename(columns={"Date": "DATE"})
+        .assign(DATE=lambda x: pd.to_datetime(x["DATE"], errors="coerce"))
+        .dropna(subset=["DATE", "EUR_NOK"])
+        .sort_values("DATE")
+        .set_index("DATE")
+    )
 
-    # B-serie (fasit/aggregat)
-    S_b = df['EUR_NOK'].asfreq('B').ffill().astype(float)
-    S_b.name = 'EUR_NOK'
+    # Business-day series (truth / aggregation base)
+    S_b = df["EUR_NOK"].asfreq("B").ffill().astype(float)
+    S_b.name = "EUR_NOK"
 
-    # D-serie (modellinput/prognoser)
-    full_idx = pd.date_range(df.index.min(), df.index.max(), freq='D')
-    S_d = df['EUR_NOK'].reindex(full_idx).ffill().astype(float)
-    S_d.index.name = 'DATE'
-    S_d.name = 'EUR_NOK'
+    # Daily series (model inputs / forecasts)
+    full_idx = pd.date_range(df.index.min(), df.index.max(), freq="D")
+    S_d = df["EUR_NOK"].reindex(full_idx).ffill().astype(float)
+    S_d.index.name = "DATE"
+    S_d.name = "EUR_NOK"
     return S_b, S_d
 
 def last_trading_day(S_b: pd.Series, start: pd.Timestamp, end: pd.Timestamp) -> Optional[pd.Timestamp]:
+    """Return the last available business day in [start, end]."""
     sl = S_b.loc[start:end]
     if sl.empty:
         return None
     return sl.index[-1]
 
 # -----------------------------
-# Modell (TimesFM 2.0 – 500M, PyTorch)
+# Model (TimesFM 2.0 – 500M, PyTorch)
 # -----------------------------
 def build_model(max_context: int, horizon_len: int):
+    """
+    Build a TimesFM 2.0 (500M) model using the v1 PyTorch backend.
+    """
     required = all([
         hasattr(timesfm, "TimesFm"),
         hasattr(timesfm, "TimesFmHparams"),
@@ -108,7 +120,7 @@ def build_model(max_context: int, horizon_len: int):
     ])
     if not required:
         raise RuntimeError(
-            "TimesFM v1-API ikke funnet. Installer 'timesfm==1.3.0' for 2.0-500M: "
+            "TimesFM v1 API not found. Install 'timesfm==1.3.0' for 2.0-500M: "
             "python -m pip install timesfm==1.3.0"
         )
 
@@ -116,7 +128,7 @@ def build_model(max_context: int, horizon_len: int):
         hparams=timesfm.TimesFmHparams(
             backend="torch",
             per_core_batch_size=32,
-            horizon_len=horizon_len,   # må dekke lengste måned (~31); bruk 64 for margin
+            horizon_len=horizon_len,   # must cover the longest month (~31); 64 is a safe margin
             input_patch_len=32,
             output_patch_len=128,
             num_layers=50,
@@ -130,61 +142,73 @@ def build_model(max_context: int, horizon_len: int):
     return tfm
 
 # -----------------------------
-# Walk-forward (månedlig) – kun punktprognose
+# Walk-forward (monthly) – point forecast only
 # -----------------------------
 def walk_forward_timesfm_monthly(S_b: pd.Series, S_d: pd.Series, tfm) -> pd.DataFrame:
+    """
+    Monthly walk-forward:
+
+      - Cut at the last business day of the previous month (from S_b).
+      - Use daily EUR/NOK history up to and including the cut (S_d).
+      - Forecast the full next calendar month at daily frequency.
+      - Aggregate daily forecasts to the monthly mean over business days.
+    """
     first_m = pd.Period(S_b.index.min(), freq=CFG.m_freq)
     last_m  = pd.Period(S_b.index.max(),  freq=CFG.m_freq)
     months = pd.period_range(first_m, last_m, freq=CFG.m_freq)
 
     rows: Dict = {}
-    dropped = {}
+    dropped: Dict[str, str] = {}
 
     for m in months:
         prev_m = m - 1
         m_start, m_end = m.start_time, m.end_time
         prev_start, prev_end = prev_m.start_time, prev_m.end_time
 
+        # Cut date for history
         cut = last_trading_day(S_b, prev_start, prev_end)
         if cut is None:
             dropped[str(m)] = "no_cut_in_prev_month"
             continue
 
+        # Daily history up to cut
         hist_d = S_d.loc[:cut]
         if hist_d.size < CFG.min_hist_days:
             dropped[str(m)] = f"hist<{CFG.min_hist_days}"
             continue
 
-        # B-dager i måneden (fasit)
+        # Business days in the target month (truth)
         idx_m_b = S_b.index[(S_b.index >= m_start) & (S_b.index <= m_end)]
         if idx_m_b.size < 1:
             dropped[str(m)] = "no_bdays_in_month"
             continue
         y_true = float(S_b.loc[idx_m_b].mean())
 
-        # Horisont = hele kalender-måneden (inklusive)
+        # Horizon = full calendar month length (inclusive)
         H = (m_end.date() - m_start.date()).days + 1
         if H <= 0 or H > CFG.max_horizon:
             dropped[str(m)] = f"horizon_invalid(H={H})"
             continue
 
+        # Context truncation
         context = min(CFG.max_context, len(hist_d))
         x = hist_d.values[-context:]
 
-        point_forecast, _ = tfm.forecast([x], freq=[0])  # ignorer kvantiler
+        # TimesFM forecast (point forecast only, ignore quantiles)
+        point_forecast, _ = tfm.forecast([x], freq=[0])
         pf = np.asarray(point_forecast[0])
 
         if pf.shape[0] < H:
             raise RuntimeError(
-                f"Modellen returnerte for kort horisont (pf={pf.shape[0]}) for H={H}. "
-                f"Øk 'horizon_len' i build_model(), f.eks. til 64."
+                f"The model returned a too short horizon (pf={pf.shape[0]}) for H={H}. "
+                f"Increase 'horizon_len' in build_model(), e.g. to 64."
             )
 
         pf = pf[:H]
-        f_idx = pd.date_range(cut + pd.Timedelta(days=1), periods=H, freq='D')
-        pred_daily = pd.Series(pf, index=f_idx, name='point')
+        f_idx = pd.date_range(cut + pd.Timedelta(days=1), periods=H, freq="D")
+        pred_daily = pd.Series(pf, index=f_idx, name="point")
 
-        # Aggreger til B-dager i måneden
+        # Aggregate to business days in the month
         pred_b = pred_daily.reindex(idx_m_b, method=None)
         if pred_b.isna().all():
             dropped[str(m)] = "no_overlap_pred_B_days"
@@ -198,7 +222,7 @@ def walk_forward_timesfm_monthly(S_b: pd.Series, S_d: pd.Series, tfm) -> pd.Data
             "y_pred": y_pred,
         }
 
-    df = pd.DataFrame.from_dict(rows, orient='index')
+    df = pd.DataFrame.from_dict(rows, orient="index")
     if not df.empty:
         df = df.set_index("month").sort_index()
 
@@ -211,9 +235,12 @@ def walk_forward_timesfm_monthly(S_b: pd.Series, S_d: pd.Series, tfm) -> pd.Data
     return df
 
 # -----------------------------
-# Evaluering (nivå + retning)
+# Evaluation (level + direction)
 # -----------------------------
 def evaluate(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute level errors (RMSE, MAE) and directional accuracy of monthly means.
+    """
     df = df.copy()
     df["err"] = df["y_true"] - df["y_pred"]
     eval_df = df.dropna(subset=["y_true", "y_pred"]).copy()
@@ -240,23 +267,25 @@ def evaluate(df: pd.DataFrame) -> pd.DataFrame:
     return eval_df
 
 # -----------------------------
-# Diebold–Mariano (mot Random Walk)
+# Diebold–Mariano (vs Random Walk)
 # -----------------------------
 def _normal_cdf(z: float) -> float:
-    # Standard normal CDF uten scipy
+    """Standard normal CDF without scipy."""
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
-def dm_test(y_true: pd.Series,
-            y_model: pd.Series,
-            y_rw: pd.Series,
-            h: int = 1,
-            loss: str = "mse") -> Tuple[float, float]:
+def dm_test(
+    y_true: pd.Series,
+    y_model: pd.Series,
+    y_rw: pd.Series,
+    h: int = 1,
+    loss: str = "mse"
+) -> Tuple[float, float]:
     """
-    Diebold–Mariano test for lik prediktiv nøyaktighet.
-    y_true, y_model, y_rw: justerte og like-lange serier.
-    h: forecasthorisont (1 for månedlig 1-step).
-    loss: "mse" eller "mae".
-    Returnerer (DM-statistikk, p-verdi).
+    Diebold–Mariano test for equal predictive accuracy.
+    y_true, y_model, y_rw: aligned and equally long series.
+    h: forecast horizon (1 for one-step-ahead monthly).
+    loss: "mse" or "mae".
+    Returns (DM statistic, p-value).
     """
     df = pd.concat({"y": y_true, "m": y_model, "rw": y_rw}, axis=1).dropna()
     if df.empty or len(df) < 5:
@@ -266,19 +295,18 @@ def dm_test(y_true: pd.Series,
     e_r = df["y"] - df["rw"]
     if loss.lower() == "mae":
         d = np.abs(e_m) - np.abs(e_r)
-    else:  # mse (kvadrert feil)
+    else:  # MSE (squared error)
         d = (e_m ** 2) - (e_r ** 2)
 
     N = int(len(d))
     d_mean = float(d.mean())
 
-    # HAC-varians (Newey–West Bartlett opp til h-1)
+    # HAC variance (Newey–West with Bartlett kernel up to h-1)
     gamma0 = float(np.var(d, ddof=1)) if N > 1 else 0.0
     var_bar = gamma0 / N
     if h > 1 and N > 2:
-        # sample autocovarianser
         for k in range(1, min(h - 1, N - 1) + 1):
-            w_k = 1.0 - k / h  # Bartlett
+            w_k = 1.0 - k / h  # Bartlett weight
             cov_k = float(np.cov(d[k:], d[:-k], ddof=1)[0, 1])
             var_bar += 2.0 * w_k * cov_k / N
 
@@ -286,13 +314,13 @@ def dm_test(y_true: pd.Series,
         return float("nan"), float("nan")
 
     dm_stat = d_mean / math.sqrt(var_bar)
-    # tosidig p-verdi
+    # two-sided p-value
     p_val = 2.0 * (1.0 - _normal_cdf(abs(dm_stat)))
     return dm_stat, p_val
 
 def dm_against_random_walk(eval_df: pd.DataFrame, loss: str = "mse", h: int = 1) -> None:
     """
-    Random walk-benchmark: forrige måneds observasjon (y_prev).
+    Random walk benchmark: previous month's observed level (y_{t-1}).
     """
     df = eval_df.copy()
     df["rw_pred"] = df["y_true"].shift(1)
@@ -303,9 +331,12 @@ def dm_against_random_walk(eval_df: pd.DataFrame, loss: str = "mse", h: int = 1)
     print(f"p-value     : {p_val:.4f}" if np.isfinite(p_val) else "p-value     : nan")
 
 # -----------------------------
-# Plot – stil som i eksempelet (ingen bånd)
+# Plot – simple line plot (no bands)
 # -----------------------------
 def plot_monthly_simple(eval_df: pd.DataFrame, png_path: str, pdf_path: str):
+    """
+    Simple line plot of actual vs TimesFM forecasted monthly means.
+    """
     if eval_df.empty:
         print("Nothing to plot.")
         return
@@ -313,9 +344,7 @@ def plot_monthly_simple(eval_df: pd.DataFrame, png_path: str, pdf_path: str):
     plt.figure(figsize=(10, 6))
     x = eval_df.index.to_timestamp() if isinstance(eval_df.index, pd.PeriodIndex) else eval_df.index
 
-    # Actual: svart
     plt.plot(x, eval_df["y_true"], color="black", label="Actual (monthly mean, B-days)")
-    # Forecast: blå stiplet
     plt.plot(x, eval_df["y_pred"], color="tab:blue", linestyle="--", label="Forecast (TimesFM)")
 
     plt.title("TimesFM Forecast vs Actual (Monthly Mean, EUR/NOK)")
@@ -341,17 +370,17 @@ def main():
         print(f"Data (B): {S_b.index.min().date()} → {S_b.index.max().date()} | n={len(S_b)}")
         print(f"Data (D): {S_d.index.min().date()} → {S_d.index.max().date()} | n={len(S_d)}")
 
-    # 2) Modell
+    # 2) Model
     tfm = build_model(max_context=CFG.max_context, horizon_len=min(CFG.max_horizon, 64))
 
-    # 3) Walk-forward og evaluering (månedlig)
+    # 3) Walk-forward evaluation (monthly)
     df_eval = walk_forward_timesfm_monthly(S_b, S_d, tfm)
     eval_df = evaluate(df_eval)
 
-    # 4) DM-test mot random walk (MSE; h=1). Endre til loss="mae" om ønskelig.
+    # 4) Diebold–Mariano test vs random walk (MSE; h=1)
     dm_against_random_walk(eval_df, loss="mse", h=1)
 
-    # 5) Plot i ønsket stil (ingen konfidensintervall)
+    # 5) Plot
     plot_monthly_simple(eval_df, CFG.fig_png, CFG.fig_pdf)
 
 if __name__ == "__main__":
